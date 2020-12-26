@@ -1,3 +1,5 @@
+Do not copy and use this code
+
 # cmu-nlp-qna
 Question Generation and Question Answering Project as implemented by team Savannah
 

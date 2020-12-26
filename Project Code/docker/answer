@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+import torch
+import torch.nn as nn
+#from models import InferSent
+import sys
+from scipy import spatial
+import numpy as np
+import math
+import time
+from nltk.tokenize import sent_tokenize
+from nltk.tokenize.stanford import StanfordTokenizer
+import re
+import os
+import spacy
+# Below is the Infersent class from Facebook Infersent, (https://github.com/facebookresearch/InferSent)
+class InferSent(nn.Module):
+
+    def __init__(self, config):
+        super(InferSent, self).__init__()
+        self.bsize = config['bsize']
+        self.word_emb_dim = config['word_emb_dim']
+        self.enc_lstm_dim = config['enc_lstm_dim']
+        self.pool_type = config['pool_type']
+        self.dpout_model = config['dpout_model']
+        self.version = 1 if 'version' not in config else config['version']
+
+        self.enc_lstm = nn.LSTM(self.word_emb_dim, self.enc_lstm_dim, 1,
+                                bidirectional=True, dropout=self.dpout_model)
+
+        assert self.version in [1, 2]
+        if self.version == 1:
+            self.bos = '<s>'
+            self.eos = '</s>'
+            self.max_pad = True
+            self.moses_tok = False
+        elif self.version == 2:
+            self.bos = '<p>'
+            self.eos = '</p>'
+            self.max_pad = False
+            self.moses_tok = True
+
+    def is_cuda(self):
+        # either all weights are on cpu or they are on gpu
+        return self.enc_lstm.bias_hh_l0.data.is_cuda
+
+    def forward(self, sent_tuple):
+        # sent_len: [max_len, ..., min_len] (bsize)
+        # sent: (seqlen x bsize x worddim)
+        sent, sent_len = sent_tuple
+
+        # Sort by length (keep idx)
+        sent_len_sorted, idx_sort = np.sort(sent_len)[::-1], np.argsort(-sent_len)
+        sent_len_sorted = sent_len_sorted.copy()
+        idx_unsort = np.argsort(idx_sort)
+
+        idx_sort = torch.from_numpy(idx_sort).cuda() if self.is_cuda() \
+            else torch.from_numpy(idx_sort)
+        sent = sent.index_select(1, idx_sort)
+
+        # Handling padding in Recurrent Networks
+        sent_packed = nn.utils.rnn.pack_padded_sequence(sent, sent_len_sorted)
+        sent_output = self.enc_lstm(sent_packed)[0]  # seqlen x batch x 2*nhid
+        sent_output = nn.utils.rnn.pad_packed_sequence(sent_output)[0]
+
+        # Un-sort by length
+        idx_unsort = torch.from_numpy(idx_unsort).cuda() if self.is_cuda() \
+            else torch.from_numpy(idx_unsort)
+        sent_output = sent_output.index_select(1, idx_unsort)
+
+        # Pooling
+        if self.pool_type == "mean":
+            sent_len = torch.FloatTensor(sent_len.copy()).unsqueeze(1).cuda()
+            emb = torch.sum(sent_output, 0).squeeze(0)
+            emb = emb / sent_len.expand_as(emb)
+        elif self.pool_type == "max":
+            if not self.max_pad:
+                sent_output[sent_output == 0] = -1e9
+            emb = torch.max(sent_output, 0)[0]
+            if emb.ndimension() == 3:
+                emb = emb.squeeze(0)
+                assert emb.ndimension() == 2
+
+        return emb
+
+    def set_w2v_path(self, w2v_path):
+        self.w2v_path = w2v_path
+
+    def get_word_dict(self, sentences, tokenize=True):
+        # create vocab of words
+        word_dict = {}
+        sentences = [s.split() if not tokenize else self.tokenize(s) for s in sentences]
+        for sent in sentences:
+            for word in sent:
+                if word not in word_dict:
+                    word_dict[word] = ''
+        word_dict[self.bos] = ''
+        word_dict[self.eos] = ''
+        return word_dict
+
+    def get_w2v(self, word_dict):
+        assert hasattr(self, 'w2v_path'), 'w2v path not set'
+        # create word_vec with w2v vectors
+        word_vec = {}
+        with open(self.w2v_path, encoding='utf-8') as f:
+            for line in f:
+                word, vec = line.split(' ', 1)
+                if word in word_dict:
+                    word_vec[word] = np.fromstring(vec, sep=' ')
+        #print('Found %s(/%s) words with w2v vectors' % (len(word_vec), len(word_dict)))
+        return word_vec
+
+    def get_w2v_k(self, K):
+        assert hasattr(self, 'w2v_path'), 'w2v path not set'
+        # create word_vec with k first w2v vectors
+        k = 0
+        word_vec = {}
+        with open(self.w2v_path, encoding='utf-8') as f:
+            for line in f:
+                word, vec = line.split(' ', 1)
+                if k <= K:
+                    word_vec[word] = np.fromstring(vec, sep=' ')
+                    k += 1
+                if k > K:
+                    if word in [self.bos, self.eos]:
+                        word_vec[word] = np.fromstring(vec, sep=' ')
+
+                if k > K and all([w in word_vec for w in [self.bos, self.eos]]):
+                    break
+        return word_vec
+
+    def build_vocab(self, sentences, tokenize=True):
+        assert hasattr(self, 'w2v_path'), 'w2v path not set'
+        word_dict = self.get_word_dict(sentences, tokenize)
+        self.word_vec = self.get_w2v(word_dict)
+        #print('Vocab size : %s' % (len(self.word_vec)))
+
+    # build w2v vocab with k most frequent words
+    def build_vocab_k_words(self, K):
+        assert hasattr(self, 'w2v_path'), 'w2v path not set'
+        self.word_vec = self.get_w2v_k(K)
+        #print('Vocab size : %s' % (K))
+
+    def update_vocab(self, sentences, tokenize=True):
+        assert hasattr(self, 'w2v_path'), 'warning : w2v path not set'
+        assert hasattr(self, 'word_vec'), 'build_vocab before updating it'
+        word_dict = self.get_word_dict(sentences, tokenize)
+
+        # keep only new words
+        for word in self.word_vec:
+            if word in word_dict:
+                del word_dict[word]
+
+        # udpate vocabulary
+        if word_dict:
+            new_word_vec = self.get_w2v(word_dict)
+            self.word_vec.update(new_word_vec)
+        else:
+            new_word_vec = []
+        #print('New vocab size : %s (added %s words)'% (len(self.word_vec), len(new_word_vec)))
+
+    def get_batch(self, batch):
+        # sent in batch in decreasing order of lengths
+        # batch: (bsize, max_len, word_dim)
+        embed = np.zeros((len(batch[0]), len(batch), self.word_emb_dim))
+
+        for i in range(len(batch)):
+            for j in range(len(batch[i])):
+                embed[j, i, :] = self.word_vec[batch[i][j]]
+
+        return torch.FloatTensor(embed)
+
+    def tokenize(self, s):
+        from nltk.tokenize import word_tokenize
+        if self.moses_tok:
+            s = ' '.join(word_tokenize(s))
+            s = s.replace(" n't ", "n 't ")  # HACK to get ~MOSES tokenization
+            return s.split()
+        else:
+            return word_tokenize(s)
+
+    def prepare_samples(self, sentences, bsize, tokenize, verbose):
+        sentences = [[self.bos] + s.split() + [self.eos] if not tokenize else
+                     [self.bos] + self.tokenize(s) + [self.eos] for s in sentences]
+        n_w = np.sum([len(x) for x in sentences])
+
+        # filters words without w2v vectors
+        for i in range(len(sentences)):
+            s_f = [word for word in sentences[i] if word in self.word_vec]
+            if not s_f:
+                import warnings
+                warnings.warn('No words in "%s" (idx=%s) have w2v vectors. \
+                               Replacing by "</s>"..' % (sentences[i], i))
+                s_f = [self.eos]
+            sentences[i] = s_f
+
+        lengths = np.array([len(s) for s in sentences])
+        n_wk = np.sum(lengths)
+        #if verbose:
+            #print('Nb words kept : %s/%s (%.1f%s)' % (
+                        #n_wk, n_w, 100.0 * n_wk / n_w, '%'))
+
+        # sort by decreasing length
+        lengths, idx_sort = np.sort(lengths)[::-1], np.argsort(-lengths)
+        sentences = np.array(sentences, dtype="object")[idx_sort]
+
+        return sentences, lengths, idx_sort
+
+    def encode(self, sentences, bsize=64, tokenize=True, verbose=False):
+        tic = time.time()
+        sentences, lengths, idx_sort = self.prepare_samples(
+                        sentences, bsize, tokenize, verbose)
+
+        embeddings = []
+        for stidx in range(0, len(sentences), bsize):
+            batch = self.get_batch(sentences[stidx:stidx + bsize])
+            if self.is_cuda():
+                batch = batch.cuda()
+            with torch.no_grad():
+                batch = self.forward((batch, lengths[stidx:stidx + bsize])).data.cpu().numpy()
+            embeddings.append(batch)
+        embeddings = np.vstack(embeddings)
+
+        # unsort
+        idx_unsort = np.argsort(idx_sort)
+        embeddings = embeddings[idx_unsort]
+
+        #if verbose:
+            #print('Speed : %.1f sentences/s (%s mode, bsize=%s)' % (
+                    #len(embeddings)/(time.time()-tic),
+                    #'gpu' if self.is_cuda() else 'cpu', bsize))
+        return embeddings
+
+    def visualize(self, sent, tokenize=True):
+
+        sent = sent.split() if not tokenize else self.tokenize(sent)
+        sent = [[self.bos] + [word for word in sent if word in self.word_vec] + [self.eos]]
+
+        if ' '.join(sent[0]) == '%s %s' % (self.bos, self.eos):
+            import warnings
+            warnings.warn('No words in "%s" have w2v vectors. Replacing \
+                           by "%s %s"..' % (sent, self.bos, self.eos))
+        batch = self.get_batch(sent)
+
+        if self.is_cuda():
+            batch = batch.cuda()
+        output = self.enc_lstm(batch)[0]
+        output, idxs = torch.max(output, 0)
+        # output, idxs = output.squeeze(), idxs.squeeze()
+        idxs = idxs.data.cpu().numpy()
+        argmaxs = [np.sum((idxs == k)) for k in range(len(sent[0]))]
+
+        # visualize model
+        import matplotlib.pyplot as plt
+        x = range(len(sent[0]))
+        y = [100.0 * n / np.sum(argmaxs) for n in argmaxs]
+        plt.xticks(x, sent[0], rotation=45)
+        plt.bar(x, y)
+        plt.ylabel('%')
+        plt.title('Visualisation of words importance')
+        plt.show()
+
+        return output, idxs
+
+
+# The below section contains functions taken from the github repo https://github.com/NSchrading/intro-spacy-nlp and helps find sentence, verb, object groupings in sentences
+SUBJECTS = ["nsubj", "nsubjpass", "csubj", "csubjpass", "agent", "expl"]
+OBJECTS = ["dobj", "dative", "attr", "oprd"]
+
+def getSubsFromConjunctions(subs):
+    moreSubs = []
+    for sub in subs:
+        # rights is a generator
+        rights = list(sub.rights)
+        rightDeps = {tok.lower_ for tok in rights}
+        if "and" in rightDeps:
+            moreSubs.extend([tok for tok in rights if tok.dep_ in SUBJECTS or tok.pos_ == "NOUN"])
+            if len(moreSubs) > 0:
+                moreSubs.extend(getSubsFromConjunctions(moreSubs))
+    return moreSubs
+
+def getObjsFromConjunctions(objs):
+    moreObjs = []
+    for obj in objs:
+        # rights is a generator
+        rights = list(obj.rights)
+        rightDeps = {tok.lower_ for tok in rights}
+        if "and" in rightDeps:
+            moreObjs.extend([tok for tok in rights if tok.dep_ in OBJECTS or tok.pos_ == "NOUN"])
+            if len(moreObjs) > 0:
+                moreObjs.extend(getObjsFromConjunctions(moreObjs))
+    return moreObjs
+
+def getVerbsFromConjunctions(verbs):
+    moreVerbs = []
+    for verb in verbs:
+        rightDeps = {tok.lower_ for tok in verb.rights}
+        if "and" in rightDeps:
+            moreVerbs.extend([tok for tok in verb.rights if tok.pos_ == "VERB"])
+            if len(moreVerbs) > 0:
+                moreVerbs.extend(getVerbsFromConjunctions(moreVerbs))
+    return moreVerbs
+
+def findSubs(tok):
+    head = tok.head
+    while head.pos_ != "VERB" and head.pos_ != "NOUN" and head.head != head:
+        head = head.head
+    if head.pos_ == "VERB":
+        subs = [tok for tok in head.lefts if tok.dep_ == "SUB"]
+        if len(subs) > 0:
+            verbNegated = isNegated(head)
+            subs.extend(getSubsFromConjunctions(subs))
+            return subs, verbNegated
+        elif head.head != head:
+            return findSubs(head)
+    elif head.pos_ == "NOUN":
+        return [head], isNegated(tok)
+    return [], False
+
+def isNegated(tok):
+    negations = {"no", "not", "n't", "never", "none"}
+    for dep in list(tok.lefts) + list(tok.rights):
+        if dep.lower_ in negations:
+            return True
+    return False
+
+def findSVs(tokens):
+    svs = []
+    verbs = [tok for tok in tokens if tok.pos_ == "VERB"]
+    for v in verbs:
+        subs, verbNegated = getAllSubs(v)
+        if len(subs) > 0:
+            for sub in subs:
+                svs.append((sub.orth_, "!" + v.orth_ if verbNegated else v.orth_))
+    return svs
+
+def getObjsFromPrepositions(deps):
+    objs = []
+    for dep in deps:
+        if dep.pos_ == "ADP" and dep.dep_ == "prep":
+            objs.extend([tok for tok in dep.rights if tok.dep_  in OBJECTS or (tok.pos_ == "PRON" and tok.lower_ == "me")])
+    return objs
+
+def getObjsFromAttrs(deps):
+    for dep in deps:
+        if dep.pos_ == "NOUN" and dep.dep_ == "attr":
+            verbs = [tok for tok in dep.rights if tok.pos_ == "VERB"]
+            if len(verbs) > 0:
+                for v in verbs:
+                    rights = list(v.rights)
+                    objs = [tok for tok in rights if tok.dep_ in OBJECTS]
+                    objs.extend(getObjsFromPrepositions(rights))
+                    if len(objs) > 0:
+                        return v, objs
+    return None, None
+
+def getObjFromXComp(deps):
+    for dep in deps:
+        if dep.pos_ == "VERB" and dep.dep_ == "xcomp":
+            v = dep
+            rights = list(v.rights)
+            objs = [tok for tok in rights if tok.dep_ in OBJECTS]
+            objs.extend(getObjsFromPrepositions(rights))
+            if len(objs) > 0:
+                return v, objs
+    return None, None
+
+def getAllSubs(v):
+    verbNegated = isNegated(v)
+    subs = [tok for tok in v.lefts if tok.dep_ in SUBJECTS and tok.pos_ != "DET"]
+    if len(subs) > 0:
+        subs.extend(getSubsFromConjunctions(subs))
+    else:
+        foundSubs, verbNegated = findSubs(v)
+        subs.extend(foundSubs)
+    return subs, verbNegated
+
+def getAllObjs(v):
+    # rights is a generator
+    rights = list(v.rights)
+    objs = [tok for tok in rights if tok.dep_ in OBJECTS]
+    objs.extend(getObjsFromPrepositions(rights))
+
+    #potentialNewVerb, potentialNewObjs = getObjsFromAttrs(rights)
+    #if potentialNewVerb is not None and potentialNewObjs is not None and len(potentialNewObjs) > 0:
+    #    objs.extend(potentialNewObjs)
+    #    v = potentialNewVerb
+
+    potentialNewVerb, potentialNewObjs = getObjFromXComp(rights)
+    if potentialNewVerb is not None and potentialNewObjs is not None and len(potentialNewObjs) > 0:
+        objs.extend(potentialNewObjs)
+        v = potentialNewVerb
+    if len(objs) > 0:
+        objs.extend(getObjsFromConjunctions(objs))
+    return v, objs
+
+def findSVOs(tokens):
+    svos = []
+    verbs = [tok for tok in tokens if tok.pos_ == "VERB" and tok.dep_ != "aux"]
+    for v in verbs:
+        subs, verbNegated = getAllSubs(v)
+        # hopefully there are subs, if not, don't examine this verb any longer
+        if len(subs) > 0:
+            v, objs = getAllObjs(v)
+            for sub in subs:
+                for obj in objs:
+                    objNegated = isNegated(obj)
+                    svos.append((sub.lower_, "!" + v.lower_ if verbNegated or objNegated else v.lower_, obj.lower_))
+    return svos
+# Here ends the section from the online github repo that helps find subject, verb, object groupings
+
+def QuestionGenCos(A,Q):
+   cosineSimilarity = float("-inf")
+   AIndex = 0
+   #magnitudeQ = numpy.linalg.norm(numpy.array(Q))
+   for (i,sentences) in enumerate(A):
+      cosSim = 1 - spatial.distance.cosine(sentences, Q)
+      if cosSim > cosineSimilarity:
+         cosineSimilarity = cosSim
+         AIndex = i
+   return AIndex
+
+if __name__ == "__main__":
+   nlp = spacy.load("en_core_web_sm")
+   fileName = sys.argv[1]
+   questionFile = sys.argv[2]
+
+   sentences = []
+   with open(fileName, 'r') as fileinput:
+      line = fileinput.read().replace("\n", " ")
+   fileinput.close()
+   temp = line.split("  ")
+   for thing in temp:
+      for thing2 in sent_tokenize(thing):
+         sentences.append(thing2.strip())
+   #for sentence in sentences:
+      #print(sentence + "\n")
+
+   questions = []
+   with open(questionFile, 'r') as fileinput:
+      for line in fileinput:
+         questions.append(line)
+   V = 2
+   MODEL_PATH = 'infersent%s.pkl' % V
+   params_model = {'bsize': 64, 'word_emb_dim': 300, 'enc_lstm_dim': 2048,
+                  'pool_type': 'max', 'dpout_model': 0.0, 'version': V}
+   infersent = InferSent(params_model)
+   infersent.load_state_dict(torch.load(MODEL_PATH))
+   W2V_PATH = 'crawl-300d-2M.vec'
+   infersent.set_w2v_path(W2V_PATH)
+   #infersent.build_vocab(sentences, tokenize=True)
+   infersent.build_vocab_k_words(K=100000)
+
+   sent_embeddings = infersent.encode(sentences, tokenize=True)
+   ques_embeddings = infersent.encode(questions, tokenize=True)
+   answers = []
+   for i in range(len(questions)):
+      answered = False
+      quessvo = findSVOs(nlp(questions[i]))
+      questionvec = ques_embeddings[i]
+      index = QuestionGenCos(sent_embeddings, questionvec)
+      answersvo = findSVOs(nlp(sentences[index]))
+      for triple in answersvo:
+         if (triple != []):
+            for questriple in quessvo:
+               if (questriple != []):
+                  if (triple[1] == questriple[1]):
+                     if (triple[0] != questriple[0]):
+                        answered = True
+                        answers.append(triple[0].capitalize())
+                        break
+                     else:
+                        answered = True
+                        answers.append(triple[2].capitalize())
+                        break
+            if (answered):
+               break
+      if (answered == False):
+         answers.append(sentences[index])
+   for answer in answers:
+      print(answer)

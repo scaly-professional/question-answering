@@ -1,0 +1,42 @@
+#!/usr/bin/python3 -W ignore::DeprecationWarning
+# -*- coding:utf8 -*-
+
+
+"""This file should be the entrypoint to our question asking module."""
+import sys
+
+try:
+    from questioning.q_generator import QuestionGenerator
+except Exception:
+    from q_generator import QuestionGenerator
+
+if __name__ == "__main__":
+    input_file = sys.argv[1]
+    N = int(sys.argv[2])
+
+
+    with open(input_file, 'r') as f:
+        data_string = ''
+        for line in f:
+            sents = line.split()
+            if len(sents) > 0 and sents[0] == 'References':
+                break
+            if '.' in line and len(sents) > 7:
+                data_string += line +'\n'
+            
+        # data = f.read()
+        ask = QuestionGenerator(data_string)
+        # Questions returned by this function should be in order of accuracy.
+        questions = ask.generate_quiz(N)
+        count_question = len(questions)
+        best_questions = []
+        questions.sort(key=lambda x:x[1], reverse=True)
+        if N > count_question:
+            print(questions[i][0])
+        i = 0
+        while (len(best_questions) < N):
+            if len(questions[i][0]) > 15 and ('\n' not in questions[i][0]):
+                best_questions.append(questions[i][0])
+            i += 1
+        for q in best_questions:
+            print(q)
